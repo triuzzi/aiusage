@@ -13,7 +13,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Footer, Label, Static
+from textual.widgets import Footer, Label, Rule, Static
 
 from .data import (
     DailyUsage,
@@ -164,14 +164,14 @@ class UsagePanel(Static):
     """
 
     def __init__(self) -> None:
-        super().__init__("")
+        super().__init__("[dim]Loading personal usage...[/]")
         self._days: list[DailyUsage] = []
 
     def set_data(self, days: list[DailyUsage]) -> None:
         self._days = days
-        self._render()
+        self._rebuild()
 
-    def _render(self) -> None:
+    def _rebuild(self) -> None:
         if not self._days:
             self.update("[dim]Loading personal usage from ccusage...[/]")
             return
@@ -308,7 +308,7 @@ class RaceTrack(Static):
     """
 
     def __init__(self) -> None:
-        super().__init__("")
+        super().__init__("[dim]Loading team scoreboard...[/]")
         self._members: list[TeamMember] = []
         self._error: str | None = None
         self._sort = "spend"  # spend or lines
@@ -318,13 +318,13 @@ class RaceTrack(Static):
         self._members = members
         self._error = error
         self._period_label = period
-        self._render()
+        self._rebuild()
 
     def set_sort(self, sort: str) -> None:
         self._sort = sort
-        self._render()
+        self._rebuild()
 
-    def _render(self) -> None:
+    def _rebuild(self) -> None:
         if self._error and not self._members:
             self.update(
                 f"\n[dim]\u2500\u2500 TEAM RACING \u2500\u2500[/]\n\n"
@@ -459,7 +459,7 @@ class ClaudeUsageApp(App):
     CSS = """
     Screen { background: #ffffff; color: #1a1a1a; }
     ModalScreen { background: rgba(0, 0, 0, 0.4); }
-    #divider { height: 1; background: #e0e0e0; }
+    Rule { color: #e0e0e0; margin: 0; }
     """
 
     BINDINGS = [
@@ -486,7 +486,7 @@ class ClaudeUsageApp(App):
     def compose(self) -> ComposeResult:
         yield HeaderBar()
         yield UsagePanel()
-        yield Static("", id="divider")
+        yield Rule()
         yield RaceTrack()
         yield Footer()
 
