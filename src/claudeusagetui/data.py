@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
-import shutil
-import sqlite3
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,33 +29,50 @@ class DailyUsage:
     models: dict[str, ModelUsage] = field(default_factory=dict)
 
 
-@dataclass
-class TeamMember:
-    email: str
-    spend: float
-    lines_accepted: int = 0
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-MODEL_SHORT: dict[str, str] = {
-    "opus-4-6": "op4.6",
-    "opus-4-5": "op4.5",
-    "sonnet-4-6": "sn4.6",
-    "sonnet-4-5": "sn4.5",
-    "haiku-4-5": "hk4.5",
-    "sonnet-3-5": "sn3.5",
-    "haiku-3-5": "hk3.5",
-}
+_CLAUDE_FAMILY = {"opus": "op", "sonnet": "sn", "haiku": "hk"}
 
 
 def short_model(name: str) -> str:
-    for k, v in MODEL_SHORT.items():
-        if k in name:
-            return v
-    return name[:5]
+    """Auto-generate short model names.
+
+    claude-opus-4-7-20260416  -> op4.7
+    claude-sonnet-4-6         -> sn4.6
+    claude-haiku-4-5-20251001 -> hk4.5
+    gpt-5.4-mini              -> 5.4m
+    gpt-5.3-codex             -> 5.3cx
+    gpt-5.4                   -> 5.4
+    """
+    # Claude: claude-{family}-{major}-{minor}[-date]
+    for family, prefix in _CLAUDE_FAMILY.items():
+        if family in name:
+            m = re.search(rf"{family}-(\d+)-(\d+)", name)
+            if m:
+                return f"{prefix}{m.group(1)}.{m.group(2)}"
+
+    # GPT: gpt-{version}[-suffix]
+    m = re.search(r"gpt-(\d+(?:\.\d+)?)-?(.*)", name)
+    if m:
+        ver = m.group(1)
+        suffix = m.group(2)
+        tag = ""
+        if "mini" in suffix:
+            tag = "m"
+        elif "codex" in suffix:
+            tag = "cx"
+        return f"{ver}{tag}"
+
+    return name[:6]
+
+
+def model_provider(name: str) -> str:
+    """Classify a model name as 'claude' or 'codex'."""
+    if name.startswith("claude"):
+        return "claude"
+    return "codex"
 
 
 def fmt_tokens(n: int) -> str:
@@ -78,39 +90,325 @@ def fmt_cost(n: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ccusage CLI
+# Pricing (per-token, USD) — fetched from LiteLLM at startup, with fallback
 # ---------------------------------------------------------------------------
 
-def fetch_ccusage(since_days: int = 60) -> list[DailyUsage]:
-    since = (datetime.now() - timedelta(days=since_days)).strftime("%Y%m%d")
-    try:
-        result = subprocess.run(
-            ["ccusage", "daily", "--since", since, "--json", "--breakdown"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            log.warning("ccusage failed: %s", result.stderr[:200])
-            return []
-        raw = json.loads(result.stdout)
-    except Exception:
-        log.exception("ccusage error")
-        return []
+LITELLM_PRICING_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
 
+# Fallback pricing when LiteLLM is unreachable (keyed by substring match)
+_FALLBACK_PRICING: dict[str, dict[str, float]] = {
+    "opus-4-7": {"input": 5e-6, "output": 25e-6, "cache_write": 6.25e-6, "cache_read": 0.5e-6},
+    "opus-4-6": {"input": 5e-6, "output": 25e-6, "cache_write": 6.25e-6, "cache_read": 0.5e-6},
+    "opus-4-5": {"input": 5e-6, "output": 25e-6, "cache_write": 6.25e-6, "cache_read": 0.5e-6},
+    "opus-4-1": {"input": 15e-6, "output": 75e-6, "cache_write": 18.75e-6, "cache_read": 1.5e-6},
+    "sonnet-4-6": {"input": 3e-6, "output": 15e-6, "cache_write": 3.75e-6, "cache_read": 0.3e-6},
+    "sonnet-4-5": {"input": 3e-6, "output": 15e-6, "cache_write": 3.75e-6, "cache_read": 0.3e-6},
+    "haiku-4-5": {"input": 1e-6, "output": 5e-6, "cache_write": 1.25e-6, "cache_read": 0.1e-6},
+    "sonnet-3-5": {"input": 3e-6, "output": 15e-6, "cache_write": 3.75e-6, "cache_read": 0.3e-6},
+    "haiku-3-5": {"input": 0.8e-6, "output": 4e-6, "cache_write": 1e-6, "cache_read": 0.08e-6},
+}
+
+# Populated at startup by _load_pricing()
+_PRICING: dict[str, dict[str, float]] = {}
+
+
+def _load_pricing() -> None:
+    """Fetch pricing from LiteLLM and build a lookup table keyed by model name.
+
+    Falls back to hardcoded pricing on failure.
+    """
+    global _PRICING
+
+    try:
+        req = Request(LITELLM_PRICING_URL)
+        with urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read())
+    except Exception:
+        log.warning("Could not fetch LiteLLM pricing — using fallback")
+        _PRICING = dict(_FALLBACK_PRICING)
+        return
+
+    pricing: dict[str, dict[str, float]] = {}
+    for key, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        inp = val.get("input_cost_per_token")
+        out = val.get("output_cost_per_token")
+        if inp is None or out is None:
+            continue
+        entry = {
+            "input": float(inp),
+            "output": float(out),
+            "cache_write": float(val.get("cache_creation_input_token_cost") or 0),
+            "cache_read": float(val.get("cache_read_input_token_cost") or 0),
+        }
+        pricing[key] = entry
+
+    if pricing:
+        _PRICING = pricing
+        log.info("Loaded pricing for %d models from LiteLLM", len(pricing))
+    else:
+        _PRICING = dict(_FALLBACK_PRICING)
+
+
+def _compute_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Compute cost for a single request given token counts."""
+    if not _PRICING:
+        _load_pricing()
+
+    # Try exact match first (LiteLLM keys like "claude-opus-4-6")
+    rates = _PRICING.get(model)
+    if not rates:
+        # Try substring match (fallback keys like "opus-4-6")
+        for pattern, r in _PRICING.items():
+            if pattern in model:
+                rates = r
+                break
+    if rates:
+        return (
+            input_tokens * rates["input"]
+            + output_tokens * rates["output"]
+            + cache_write_tokens * rates.get("cache_write", 0)
+            + cache_read_tokens * rates.get("cache_read", 0)
+        )
+    # No pricing available (unknown models)
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Claude Code JSONL reader (~/.claude/projects/**/*.jsonl)
+# ---------------------------------------------------------------------------
+
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+
+def _read_claude_usage(since: str) -> dict[str, dict[str, ModelUsage]]:
+    """Read Claude Code JSONL files and aggregate by date + model.
+
+    Deduplicates by ``message.id`` (same response appears in parent and
+    subagent files). Groups by local-timezone date.
+
+    Returns {date: {model: ModelUsage}}.
+    """
+    result: dict[str, dict[str, ModelUsage]] = {}
+    if not CLAUDE_DIR.exists():
+        return result
+
+    seen_ids: set[str] = set()
+    local_tz = datetime.now().astimezone().tzinfo
+
+    for path in CLAUDE_DIR.rglob("*.jsonl"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    ts = obj.get("timestamp")
+                    msg = obj.get("message")
+                    if not ts or not msg:
+                        continue
+
+                    model = msg.get("model", "")
+                    usage = msg.get("usage")
+                    if not model or not usage or model == "<synthetic>":
+                        continue
+
+                    # Deduplicate by message.id or requestId
+                    msg_id = msg.get("id", "") or obj.get("requestId", "")
+                    if msg_id:
+                        if msg_id in seen_ids:
+                            continue
+                        seen_ids.add(msg_id)
+
+                    # Convert UTC timestamp to local date
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        date = dt.astimezone(local_tz).strftime("%Y-%m-%d")
+                    except (ValueError, OSError):
+                        date = ts[:10]
+
+                    if date < since:
+                        continue
+
+                    inp = usage.get("input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    cw = usage.get("cache_creation_input_tokens", 0)
+                    cr = usage.get("cache_read_input_tokens", 0)
+                    tokens = inp + out + cw + cr
+                    cost = _compute_cost(model, inp, out, cw, cr)
+
+                    day = result.setdefault(date, {})
+                    if model in day:
+                        day[model] = ModelUsage(
+                            name=model,
+                            tokens=day[model].tokens + tokens,
+                            cost=day[model].cost + cost,
+                        )
+                    else:
+                        day[model] = ModelUsage(name=model, tokens=tokens, cost=cost)
+        except Exception:
+            log.exception("Error reading %s", path)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Codex rollout reader (~/.codex/sessions/**/*.jsonl)
+# ---------------------------------------------------------------------------
+
+CODEX_DIR = Path.home() / ".codex" / "sessions"
+
+
+def _read_codex_usage(since: str) -> dict[str, dict[str, ModelUsage]]:
+    """Read Codex rollout JSONL files and aggregate by date + model.
+
+    Returns {date: {model: ModelUsage}}.
+    """
+    result: dict[str, dict[str, ModelUsage]] = {}
+    if not CODEX_DIR.exists():
+        return result
+
+    local_tz = datetime.now().astimezone().tzinfo
+
+    for path in CODEX_DIR.rglob("*.jsonl"):
+        try:
+            model = ""
+            prev_total = 0
+            date = ""
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = obj.get("type", "")
+
+                    # Extract model from session_meta or turn_context
+                    if etype == "session_meta":
+                        payload = obj.get("payload", {})
+                        ts = payload.get("timestamp", obj.get("timestamp", ""))
+                        try:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            date = dt.astimezone(local_tz).strftime("%Y-%m-%d")
+                        except (ValueError, OSError):
+                            date = ts[:10]
+                        if date < since:
+                            break  # skip entire file
+                    elif etype == "turn_context":
+                        payload = obj.get("payload", {})
+                        m = payload.get("model", "")
+                        if m:
+                            model = m
+
+                    # Extract per-turn token delta from token_count events
+                    elif etype == "event_msg":
+                        payload = obj.get("payload", {})
+                        if payload.get("type") != "token_count":
+                            continue
+                        info = payload.get("info")
+                        if not info:
+                            continue
+
+                        if not date:
+                            ts = obj.get("timestamp", "")
+                            try:
+                                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                date = dt.astimezone(local_tz).strftime("%Y-%m-%d")
+                            except (ValueError, OSError):
+                                date = ts[:10]
+                            if date < since:
+                                break
+
+                        # Use total_token_usage delta to avoid double-counting
+                        total = info.get("total_token_usage", {})
+                        new_total = total.get("total_tokens", 0)
+                        if new_total <= prev_total:
+                            continue  # duplicate event
+                        prev_total = new_total
+
+                        last = info.get("last_token_usage", {})
+                        inp = last.get("input_tokens", 0)
+                        out = last.get("output_tokens", 0)
+                        cached = last.get("cached_input_tokens", 0)
+                        tokens = inp + out
+                        cost = _compute_cost(model, inp - cached, out)
+
+                        if not model or not date:
+                            continue
+
+                        day = result.setdefault(date, {})
+                        if model in day:
+                            day[model] = ModelUsage(
+                                name=model,
+                                tokens=day[model].tokens + tokens,
+                                cost=day[model].cost + cost,
+                            )
+                        else:
+                            day[model] = ModelUsage(name=model, tokens=tokens, cost=cost)
+        except Exception:
+            log.exception("Error reading %s", path)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Unified fetcher
+# ---------------------------------------------------------------------------
+
+def fetch_usage(since_days: int = 60) -> list[DailyUsage]:
+    """Read usage from both Claude Code and Codex, merged by date."""
+    since = (datetime.now() - timedelta(days=since_days)).strftime("%Y-%m-%d")
+
+    claude = _read_claude_usage(since)
+    codex = _read_codex_usage(since)
+
+    # Merge into unified dict
+    all_dates: dict[str, dict[str, ModelUsage]] = {}
+    for source in (claude, codex):
+        for date, models in source.items():
+            day = all_dates.setdefault(date, {})
+            for name, mu in models.items():
+                if name in day:
+                    day[name] = ModelUsage(
+                        name=name,
+                        tokens=day[name].tokens + mu.tokens,
+                        cost=day[name].cost + mu.cost,
+                    )
+                else:
+                    day[name] = ModelUsage(name=name, tokens=mu.tokens, cost=mu.cost)
+
+    # Convert to sorted list
     days: list[DailyUsage] = []
-    for d in raw.get("daily", []):
-        models: dict[str, ModelUsage] = {}
-        for mb in d.get("modelBreakdowns", []):
-            tokens = (
-                mb.get("inputTokens", 0) + mb.get("outputTokens", 0)
-                + mb.get("cacheCreationTokens", 0) + mb.get("cacheReadTokens", 0)
-            )
-            models[mb["modelName"]] = ModelUsage(name=mb["modelName"], tokens=tokens, cost=mb.get("cost", 0))
+    for date in sorted(all_dates):
+        models = all_dates[date]
+        total_tokens = sum(m.tokens for m in models.values())
+        total_cost = sum(m.cost for m in models.values())
         days.append(DailyUsage(
-            date=d["date"],
-            total_tokens=d.get("totalTokens", 0),
-            total_cost=d.get("totalCost", 0),
+            date=date,
+            total_tokens=total_tokens,
+            total_cost=total_cost,
             models=models,
         ))
+
     return days
 
 
@@ -158,265 +456,3 @@ def sparkline(days: list[DailyUsage], last_n: int = 30) -> str:
         return ""
     peak = max(costs) or 1
     return "".join(blocks[min(8, int(c / peak * 8))] for c in costs)
-
-
-# ---------------------------------------------------------------------------
-# Brave cookie extraction (macOS)
-# ---------------------------------------------------------------------------
-
-def _get_brave_aes_key() -> bytes | None:
-    """Derive AES key from Brave's Keychain-stored Safe Storage password."""
-    try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: F401
-    except ImportError:
-        log.warning("cryptography not installed — platform API disabled")
-        return None
-
-    try:
-        key_bytes = subprocess.check_output(
-            ["security", "find-generic-password", "-w", "-s", "Brave Safe Storage", "-a", "Brave"],
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        return hashlib.pbkdf2_hmac("sha1", key_bytes, b"saltysalt", 1003, dklen=16)
-    except Exception:
-        log.exception("Failed to get Brave encryption key")
-        return None
-
-
-def _decrypt_cookie(encrypted: bytes, aes_key: bytes) -> str | None:
-    """Decrypt a single Brave cookie value (v10 AES-128-CBC)."""
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-    if not encrypted or encrypted[:3] != b"v10":
-        return encrypted.decode("utf-8", errors="replace") if encrypted else None
-
-    ct = encrypted[3:]
-    iv = b" " * 16
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    plain = decryptor.update(ct) + decryptor.finalize()
-
-    # Strip PKCS7 padding
-    pad = plain[-1]
-    if 0 < pad <= 16 and all(b == pad for b in plain[-pad:]):
-        plain = plain[:-pad]
-
-    # First 2 AES blocks (32 bytes) are garbage due to CBC IV;
-    # try known token patterns first, then fall back to byte-32 onward.
-    for pattern in (rb"sk-ant-\S+", rb"[0-9a-f]{8}-[0-9a-f]{4}-"):
-        match = re.search(pattern, plain)
-        if match:
-            # For UUIDs, capture the full UUID
-            if b"-" in match.group(0):
-                uuid_match = re.search(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", plain)
-                if uuid_match:
-                    return uuid_match.group(0).decode("ascii")
-            else:
-                return match.group(0).decode("ascii")
-
-    # Fallback: skip first 2 blocks, take printable ASCII
-    chunk = plain[32:]
-    try:
-        return chunk.decode("utf-8").strip("\x00")
-    except UnicodeDecodeError:
-        # Extract longest printable ASCII run
-        m = re.search(rb"[\x20-\x7e]{4,}", chunk)
-        return m.group(0).decode("ascii") if m else None
-
-
-def _get_brave_cookies(hosts: list[str], names: list[str] | None = None) -> dict[str, str]:
-    """Extract cookies for given hosts from Brave. Returns {name: value} dict."""
-    aes_key = _get_brave_aes_key()
-    if not aes_key:
-        return {}
-
-    cookie_db = Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies"
-    if not cookie_db.exists():
-        log.warning("Brave cookie DB not found")
-        return {}
-
-    tmp = tempfile.mktemp(suffix=".db")
-    shutil.copy2(cookie_db, tmp)
-
-    try:
-        conn = sqlite3.connect(tmp)
-        placeholders = ",".join("?" * len(hosts))
-        query = f"SELECT name, encrypted_value, host_key FROM cookies WHERE host_key IN ({placeholders})"
-        if names:
-            name_ph = ",".join("?" * len(names))
-            query += f" AND name IN ({name_ph})"
-            rows = conn.execute(query, hosts + names).fetchall()
-        else:
-            rows = conn.execute(query, hosts).fetchall()
-        conn.close()
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-    cookies: dict[str, str] = {}
-    for name, enc, host in rows:
-        val = _decrypt_cookie(enc, aes_key)
-        if val:
-            cookies[name] = val
-
-    return cookies
-
-
-_COOKIE_HOSTS = [
-    ".platform.claude.com", "platform.claude.com",
-    ".claude.com", "claude.com",
-]
-
-
-def _build_cookie_jar() -> tuple[dict[str, str], str]:
-    """Extract all relevant cookies and build Cookie header string."""
-    cookies = _get_brave_cookies(_COOKIE_HOSTS)
-    header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    return cookies, header
-
-
-# ---------------------------------------------------------------------------
-# Platform API
-# ---------------------------------------------------------------------------
-
-PLATFORM_BASE = "https://platform.claude.com"
-
-_PLATFORM_HEADERS = {
-    "Accept": "*/*",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-    ),
-    "anthropic-client-platform": "web_console",
-    "anthropic-client-version": "unknown",
-    "Content-Type": "application/json",
-    "Referer": "https://platform.claude.com/claude-code",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
-
-
-def _platform_get(path: str, cookie_header: str) -> dict | None:
-    url = f"{PLATFORM_BASE}{path}"
-    headers = {**_PLATFORM_HEADERS, "Cookie": cookie_header}
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        log.exception("Platform API failed: %s", path)
-        return None
-
-
-def get_org_uuid(cookie_header: str) -> str | None:
-    """Resolve active organization UUID via bootstrap."""
-    data = _platform_get(
-        "/api/bootstrap?statsig_hashing_algorithm=djb2&growthbook_format=sdk",
-        cookie_header,
-    )
-    if not data:
-        return None
-
-    account = data.get("account")
-    if not account:
-        return None
-
-    # Try memberships → organization → uuid
-    memberships = account.get("memberships", [])
-    if memberships:
-        org = memberships[0].get("organization", {})
-        if org.get("uuid"):
-            return org["uuid"]
-
-    # Fallback: direct fields
-    for key in ("active_organization_uuid", "organization_uuid"):
-        if account.get(key):
-            return account[key]
-
-    # Fallback: organizations list
-    orgs = account.get("organizations", [])
-    if orgs:
-        return orgs[0].get("uuid")
-
-    log.warning("Could not resolve org UUID from bootstrap: keys=%s", list(account.keys()))
-    return None
-
-
-def fetch_team(cookie_header: str, org_uuid: str, start_date: str, end_date: str) -> list[TeamMember]:
-    """Fetch all team members' usage (paginated)."""
-    members: list[TeamMember] = []
-    offset = 0
-    limit = 50
-
-    while True:
-        path = (
-            f"/api/claude_code/metrics_aggs/users?"
-            f"start_date={start_date}&end_date={end_date}"
-            f"&limit={limit}&offset={offset}"
-            f"&sort_by=total_cost_usd&sort_order=desc"
-            f"&organization_uuid={org_uuid}"
-        )
-        data = _platform_get(path, cookie_header)
-        if not data:
-            break
-
-        users = data.get("users", [])
-        if not users:
-            break
-
-        for u in users:
-            email = u.get("email") or f"{u.get('api_key_name', 'API key')} [API]"
-            try:
-                spend = float(u.get("total_cost", 0) or 0)
-            except (ValueError, TypeError):
-                spend = 0.0
-            members.append(TeamMember(
-                email=email,
-                spend=spend,
-                lines_accepted=u.get("total_lines_accepted", 0) or 0,
-            ))
-
-        pagination = data.get("pagination", {})
-        if not pagination.get("has_next", False):
-            break
-        offset += limit
-
-    return members
-
-
-class PlatformClient:
-    """Lazy-init wrapper around the platform API."""
-
-    def __init__(self) -> None:
-        self._cookie_header: str | None = None
-        self.org_uuid: str | None = None
-        self._initialized = False
-        self.error: str | None = None
-        self.connected = False
-
-    def init(self) -> bool:
-        """Try to authenticate. Returns True if ready."""
-        if self._initialized:
-            return self.connected
-
-        self._initialized = True
-        cookies, cookie_header = _build_cookie_jar()
-        if "sessionKey" not in cookies:
-            self.error = "No session cookie — open platform.claude.com in Brave first"
-            return False
-
-        self._cookie_header = cookie_header
-
-        self.org_uuid = get_org_uuid(cookie_header)
-        if not self.org_uuid:
-            self.error = "Could not resolve organization — check platform.claude.com login"
-            return False
-
-        self.error = None
-        self.connected = True
-        return True
-
-    def fetch_team(self, start_date: str, end_date: str) -> list[TeamMember]:
-        if not self._cookie_header or not self.org_uuid:
-            return []
-        return fetch_team(self._cookie_header, self.org_uuid, start_date, end_date)

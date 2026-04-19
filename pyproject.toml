@@ -1,12 +1,11 @@
 [project]
 name = "claudeusagetui"
 version = "0.1.0"
-description = "Claude Code usage dashboard TUI — personal stats, team racing scoreboard, tamagotchi cat"
+description = "Claude Code & Codex usage dashboard TUI — personal stats, model breakdown, tamagotchi cat"
 requires-python = ">=3.13"
 
 dependencies = [
     "textual==8.1.1",
-    "cryptography>=44.0.0",
 ]
 
 [project.scripts]
